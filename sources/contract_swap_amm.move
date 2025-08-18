@@ -29,41 +29,11 @@ public struct Pool<phantom X, phantom Y> has key {
     coin_x : Balance<X>,
     coin_y : Balance<Y>,
     liquidity_token_supply: Supply<LiquidityToken<X, Y>>,
-    liquidity_token_sum: Balance<LiquidityToken<X, Y>>,
     fee: u64,
-}
-
-public fun sort<X,Y>() : bool {
-    let vector_x = ascii::into_bytes(type_name::into_string(type_name::get<X>()));
-    let vector_y = ascii::into_bytes(type_name::into_string(type_name::get<Y>()));
-
-    let length_vector_x = vector::length(&vector_x);
-    let length_vector_y = vector::length(&vector_y);
-
-    let mut index = 0;
-    let mut result: bool = false;
-    while (index < length_vector_x && index < length_vector_y) {
-        let char_x = *vector::borrow(&vector_x, index);
-        let char_y = *vector::borrow(&vector_y, index);
-        if (char_x < char_y) {
-            result = true;
-            break;
-        };
-        if (char_x > char_y) {
-            break;
-        };
-        index = index + 1;
-    };
-    if (length_vector_x < length_vector_y) {
-        result = true;
-    };
-    result
 }
 
 public entry fun register_pool<X,Y>(_admin: &AdminCap, fee: u64, ctx: &mut TxContext) {
     let liquid_token = LiquidityToken<X, Y>{};
-    let is_ordered = sort<X, Y>();
-    assert!(is_ordered, NOT_ORDERED);
     let pool = Pool<X, Y> {
         id: object::new(ctx),
         coin_x: balance::zero<X>(),
@@ -77,30 +47,37 @@ public entry fun register_pool<X,Y>(_admin: &AdminCap, fee: u64, ctx: &mut TxCon
 
 
 //Not check case that first time to add liquidity
-public entry fun add_liquid<X,Y>(pool: &mut Pool<X,Y>,coin_x_desired: Coin<X>, coin_y_desired: Coin<Y>, amount_x_min: u64, amount_y_min: u64, ctx: &mut TxContext){
-    let is_ordered = sort<X, Y>();
-    assert!(is_ordered, NOT_ORDERED);
-    let amount_x_desired = balance::value(&coin_x_desired);
-    let amount_y_desired = balance::value(&coin_y_desired);
+public entry fun add_liquid<X,Y>(pool: &mut Pool<X,Y>, mut coin_x_desired: Coin<X>, mut coin_y_desired: Coin<Y>, amount_x_min: u64, amount_y_min: u64, ctx: &mut TxContext){
+    let amount_x_desired = coin::value(&coin_x_desired);
+    let amount_y_desired = coin::value(&coin_y_desired);
     assert!(amount_x_desired >= amount_x_min && amount_y_desired >= amount_y_min, INVALID_WITH_INPUT_AMOUNT);
     assert!(amount_x_desired > 0 && amount_y_desired > 0 && amount_x_min > 0 && amount_y_min > 0, NOT_POSITIVE);
     
     //calcalate optimal amount of coins to add into pool
-    let (amount_x_optimal, amount_y_optimal) = calculate_amount_optimal_into_liquidity(amount_x_desired, amount_y_desired, amount_x_min, amount_y_min, pool);
+    let (amount_x_optimal, amount_y_optimal) = calculate_amount_optimal_into_liquid(amount_x_desired, amount_y_desired, amount_x_min, amount_y_min, pool);
     
     //get amount of coins according to rate of pool
-    let coin_x_optimal = coin::split(coin_x_desired, amount_x_optimal, ctx);
-    let coin_y_optimal = coin::split(coin_y_desired, amount_y_optimal, ctx);
+    let coin_x_optimal = coin::split(&mut coin_x_desired, amount_x_optimal, ctx);
+    let coin_y_optimal = coin::split(&mut coin_y_desired, amount_y_optimal, ctx);
+
+    let coin_x_optimal_balance = coin::into_balance(coin_x_optimal);
+    let coin_y_optimal_balance = coin::into_balance(coin_y_optimal);
 
     //transfer liquidity token amount 
-    let (reserver_x, reserver_y) = get_reserve(pool);
-    let value_x_optimal = coin::value(&coin_x_optimal);
-    let liquid_token_balance = calculate_liquid_token(pool, reserver_x, value_x_optimal);
-    transfer::public_transfer(liquid_token_balance, tx_context::sender(ctx));
+    let (reserve_x, reserve_y) = get_reserve(pool);
+    if (reserve_x == 0 || reserve_y == 0) {
+        let liquid_token_balance = calculate_liquid_token_first(pool, amount_x_optimal, amount_y_optimal);
+        let liquid_token_coin = coin::from_balance(liquid_token_balance, ctx);
+        transfer::public_transfer(liquid_token_coin, tx_context::sender(ctx));
+    } else {
+        let liquid_token_balance = calculate_liquid_token_not_first(pool, reserve_x, amount_x_optimal);
+        let liquid_token_coin = coin::from_balance(liquid_token_balance, ctx);
+        transfer::public_transfer(liquid_token_coin, tx_context::sender(ctx));
+    };
 
     //transfer coins to pool according to rate of pool
-    transfer::public_transfer(coin_x_optimal, &mut pool.coin_x);
-    transfer::public_transfer(coin_y_optimal, &mut pool.coin_y);
+    balance::join(&mut pool.coin_x, coin_x_optimal_balance);
+    balance::join(&mut pool.coin_y, coin_y_optimal_balance);
 
     //transfer remain coins back to sender
     transfer::public_transfer(coin_x_desired, tx_context::sender(ctx));
@@ -109,16 +86,15 @@ public entry fun add_liquid<X,Y>(pool: &mut Pool<X,Y>,coin_x_desired: Coin<X>, c
     //EMIT EVENT
 }
 
-//check name of variable
-public entry fun remove_liquid<X,Y>(pool: &mut Pool<X,Y>, balance_liquid_token: Balance<LiquidityToken<X,Y>>, amount_x_min: u64, amount_y_min: u64){
-    let is_ordered = sort<X, Y>();
-    assert!(is_ordered, NOT_ORDERED);
+// burn all liquidity token of a pool
+public entry fun remove_liquid<X,Y>(pool: &mut Pool<X,Y>, coin_liquid_token: Coin<LiquidityToken<X,Y>>, amount_x_min: u64, amount_y_min: u64, ctx: &mut TxContext){
     let (reserve_x, reserve_y) = get_reserve(pool);
-    let liquid_token_amount = balance::value(&balance_liquid_token);
+    let liquid_token_amount = coin::value(&coin_liquid_token);
     let amount_coin_x = calc_coin_amount_correspond_liqud_token(pool, liquid_token_amount, reserve_x);
     let amount_coin_y = calc_coin_amount_correspond_liqud_token(pool, liquid_token_amount, reserve_y);
     assert!(amount_coin_x >= amount_x_min && amount_coin_y >= amount_y_min, INVALID_WITH_INPUT_AMOUNT);
-    balance::decrease_supply(&mut pool.liquidity_token_supply, balance_liquid_token);
+    let liquid_token_balance = coin::into_balance(coin_liquid_token);
+    balance::decrease_supply(&mut pool.liquidity_token_supply, liquid_token_balance);
 
     let coin_x_withdraw_from_pool = coin::take(&mut pool.coin_x, amount_coin_x, ctx);
     let coin_y_withdraw_from_pool = coin::take(&mut pool.coin_y, amount_coin_y, ctx);
@@ -127,70 +103,42 @@ public entry fun remove_liquid<X,Y>(pool: &mut Pool<X,Y>, balance_liquid_token: 
 }
 
 public entry fun swap_exact_x_for_y<X,Y>(pool: &mut Pool<X,Y>, coin_in: Coin<X>, amount_out_min: u64, ctx: &mut TxContext){
-    let is_ordered = sort<X, Y>();
-    assert!(is_ordered, NOT_ORDERED);
     let (reserve_x, reserve_y) = get_reserve(pool);
     let coin_in_value = coin::value(&coin_in);
     assert!(reserve_x > 0 && reserve_y > 0, NOT_ENOUGH_LIQUIDITY);
     assert!(coin_in_value > 0 && amount_out_min > 0, NOT_POSITIVE);
     let amount_out = calculate_amount_out(pool, coin_in_value, reserve_x, reserve_y);
     assert!(amount_out >= amount_out_min, INVALID_WITH_INPUT_AMOUNT);
-    
+    assert!(reserve_y >= amount_out, NOT_ENOUGH_LIQUIDITY);
+
     handle_coin_x_from(pool, coin_in);
     
     handle_coin_y_to(pool, amount_out, ctx);
 }
 
-public entry fun swap_exact_y_for_x<X,Y>(pool: &mut Pool<X,Y>, coin_in: Coin<Y>, amount_out_min: u64, ctx: &mut TxContext){
-    let is_ordered = sort<X, Y>();
-    assert!(is_ordered, NOT_ORDERED);
-    let (reserve_x, reserve_y) = get_reserve(pool);
-    let coin_in_value = coin::value(&coin_in);
-    assert!(reserve_x > 0 && reserve_y > 0, NOT_ENOUGH_LIQUIDITY);
-    assert!(coin_in_value > 0 && amount_out_min > 0, NOT_POSITIVE);
-    let amount_out = calculate_amount_out(pool, coin_in_value, reserve_y, reserve_x);
-    assert!(amount_out >= amount_out_min, INVALID_WITH_INPUT_AMOUNT);
-    
-    handle_coin_y_from(pool, coin_in);
-    
-    handle_coin_x_to(pool, amount_out, ctx);
-}
-
-public entry fun swap_x_for_exact_y<X,Y>(pool: &mut Pool<X,Y>, coin_in_max: Coin<X>, amount_out: u64, ctx: &mut TxContext) {
-    let is_ordered = sort<X, Y>();
-    assert!(is_ordered, NOT_ORDERED);
+public entry fun swap_x_for_exact_y<X,Y>(pool: &mut Pool<X,Y>, mut coin_in_max: Coin<X>, amount_out: u64, ctx: &mut TxContext) {
     let (reserve_x, reserve_y) = get_reserve(pool);
     assert!(reserve_x > 0 && reserve_y > 0, NOT_ENOUGH_LIQUIDITY);
-    assert!(amount_out > 0, NOT_POSITIVE);
+    assert!(reserve_y >= amount_out, NOT_ENOUGH_LIQUIDITY);
     let amount_in = calculate_amount_in(pool, amount_out, reserve_x, reserve_y);
     let value_coin_in_max = coin::value(&coin_in_max);
     assert!(value_coin_in_max >= amount_in, INVALID_WITH_INPUT_AMOUNT);
 
+    let coin_in = coin::split(&mut coin_in_max, amount_in, ctx);
+
     handle_coin_x_from(pool, coin_in);
     
     handle_coin_y_to(pool, amount_out, ctx);
-}
-
-public entry fun swap_y_for_exact_x<X,Y>(pool: &mut Pool<X,Y>, coin_in_max: Coin<Y>, amount_out: u64, ctx: &mut TxContext){
-    let is_ordered = sort<X, Y>();
-    assert!(is_ordered, NOT_ORDERED);
-    let (reserve_x, reserve_y) = get_reserve(pool);
-    assert!(reserve_x > 0 && reserve_y > 0, NOT_ENOUGH_LIQUIDITY);
-    assert!(amount_out > 0, NOT_POSITIVE);
-    let amount_in = calculate_amount_in(pool, amount_out, reserve_y, reserve_x);
-    let value_coin_in_max = coin::value(&coin_in_max);
-    assert!(amount_out >= amount_out_min, INVALID_WITH_INPUT_AMOUNT);
-    
-    handle_coin_y_from(pool, coin_in);
-    
-    handle_coin_x_to(pool, amount_out, ctx);
+    transfer::public_transfer(coin_in_max, tx_context::sender(ctx));
 }
 
 public entry fun set_fee<X,Y>(pool: &mut Pool<X,Y>, new_fee: u64) {
-    let is_ordered = sort<X, Y>();
-    assert!(is_ordered, NOT_ORDERED);
-    assert!(fee > 0 && fee < 1000, NOT_POSITIVE);
-    pool.fee = fee;
+    assert!(new_fee > 0 && new_fee < 1000, NOT_POSITIVE);
+    pool.fee = new_fee;
+}
+
+public fun get_fee<X,Y>(pool: &mut Pool<X,Y>) : u64 {
+    pool.fee
 }
 
 public fun handle_coin_x_from<X,Y>(pool: &mut Pool<X,Y>, coin_from: Coin<X>){
@@ -198,18 +146,8 @@ public fun handle_coin_x_from<X,Y>(pool: &mut Pool<X,Y>, coin_from: Coin<X>){
     balance::join(&mut pool.coin_x, coin_from_balance);
 }
 
-public fun handle_coin_y_from<X,Y>(pool: &mut Pool<X,Y>, coin_from: Coin<Y>){
-    let coin_from_balance = coin::into_balance(coin_from);
-    balance::join(&mut pool.coin_y, coin_from_balance);
-}
-
 public fun handle_coin_y_to<X,Y>(pool: &mut Pool<X,Y>, amount_out:u64, ctx: &mut TxContext){
-    let coin_to_balance = balance::take(&mut pool.coin_y, amount_out, ctx);
-    transfer::public_transfer(coin_to_balance, tx_context::sender(ctx));
-}
-
-public fun handle_coin_x_to<X,Y>(pool: &mut Pool<X,Y>, amount_out:u64, ctx: &mut TxContext){
-    let coin_to_balance = balance::take(&mut pool.coin_x, amount_out, ctx);
+    let coin_to_balance = coin::take(&mut pool.coin_y, amount_out, ctx);
     transfer::public_transfer(coin_to_balance, tx_context::sender(ctx));
 }
 
@@ -249,33 +187,70 @@ public fun quote(amount_x:u64, reverser_x: u64, reverser_y: u64) : u64 {
     amount_y
 }
 
-public fun calculate_amount_optimal_into_liquid<X, Y>(amount_x_desired: u64, amount_y_desired: u64, amount_x_min: u64, amount_y_min: u64, pool: &mut Pool<X,Y>) : u64 {
+public fun calculate_amount_optimal_into_liquid<X, Y>(amount_x_desired: u64, amount_y_desired: u64, amount_x_min: u64, amount_y_min: u64, pool: &mut Pool<X,Y>) : (u64, u64) {
     let (reserve_x, reserve_y) = get_reserve(pool);
-    if (reserve_x == 0 && reserve_y == 0) {
-        (reserve_x, reserve_y)
+    if (reserve_x == 0 || reserve_y == 0) {
+        return (amount_x_desired, amount_y_desired);
     };
-    amount_y_optimal = quote(amount_x_desired, reserve_x, reserve_y);
+    let amount_y_optimal = quote(amount_x_desired, reserve_x, reserve_y);
     if ((amount_y_optimal <= amount_y_desired) && (amount_y_optimal >= amount_y_min)) {
-        (amount_x_desired, amount_y_optimal)
+        return (amount_x_desired, amount_y_optimal);
     };
-    amount_x_optimal = quote(amount_y_desired, reserve_y, reserve_x);
+    let amount_x_optimal = quote(amount_y_desired, reserve_y, reserve_x);
     if((amount_x_optimal <= amount_x_desired) && (amount_x_optimal >= amount_x_min)) {
-        (amount_x_optimal, amount_y_desired)
+        return (amount_x_optimal, amount_y_desired);
     };
+    (amount_x_min, amount_y_min)
 }
 
 //not include fee for protocol 
-public fun calculate_liquid_token<X,Y>(pool: &mut Pool<X,Y>, reserve_x: u64, amount_x_transferred: u64) : Balance<LiquidityToken<X, Y>>{
+public fun calculate_liquid_token_not_first<X,Y>(pool: &mut Pool<X,Y>, reserve_x: u64, amount_x_transferred: u64) : Balance<LiquidityToken<X, Y>>{
     let liquid_token_supply_value = balance::supply_value(&pool.liquidity_token_supply);
     let liquid_token_for_lp = quote(amount_x_transferred, reserve_x, liquid_token_supply_value);
     let balance_liquid_token_for_lp = balance::increase_supply(&mut pool.liquidity_token_supply, liquid_token_for_lp);
     balance_liquid_token_for_lp
 }
 
-//this function is temporary
-public entry fun create_coin_zero<X>(ctx: &mut TxContext) {
-    let coin = coin::zero<X>(ctx);
-    transfer::public_transfer(coin, tx_context::sender(ctx));
+public fun calculate_liquid_token_first<X,Y>(pool: &mut Pool<X,Y>, amount_x_transferred: u64, amount_y_transferred: u64) : Balance<LiquidityToken<X,Y>> {
+    let liquid_token_for_lp = sqrt(amount_x_transferred * amount_y_transferred);
+    let balance_liquid_token_for_lp = balance::increase_supply(&mut pool.liquidity_token_supply, liquid_token_for_lp);
+    balance_liquid_token_for_lp
+}
+
+public fun sqrt(x: u64) : u64 {
+    let mut sqrt_x = 1;
+    if (x > 3) {
+        sqrt_x = x;
+        let mut i = x / 2 + 1;
+        while (i < sqrt_x) {
+            sqrt_x = i;
+            i = (x / i + i) / 2;
+        };
+        sqrt_x
+    } else {
+        1
+    }
+}
+
+public fun get_coin_x_from_pool<X,Y>(pool: &mut Pool<X,Y>) : u64 {
+    balance::value(&pool.coin_x)
+}
+
+public fun get_coin_y_from_pool<X,Y>(pool: &mut Pool<X,Y>) : u64 {
+    balance::value(&pool.coin_y)
+}
+
+public fun join_coin_x_to_pool<X,Y>(pool: &mut Pool<X,Y>, amount: Balance<X>) {
+    balance::join(&mut pool.coin_x, amount);
+}
+
+public fun join_coin_y_to_pool<X,Y>(pool: &mut Pool<X,Y>, amount: Balance<Y>) {
+    balance::join(&mut pool.coin_y, amount);
+}
+
+public fun get_liquidity_token_supply<X,Y>(pool: &mut Pool<X,Y>) : u64 {
+    let liquid_token_supply_value = balance::supply_value(&pool.liquidity_token_supply);
+    liquid_token_supply_value
 }
 
 #[test_only]
